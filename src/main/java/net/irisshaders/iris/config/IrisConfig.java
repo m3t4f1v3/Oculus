@@ -3,14 +3,22 @@ package net.irisshaders.iris.config;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.gui.option.IrisVideoSettings;
 import net.irisshaders.iris.pathways.colorspace.ColorSpace;
+import net.minecraft.resources.ResourceLocation;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 /**
  * A class dedicated to storing the config values of shaderpacks. Right now it only stores the path to the current shaderpack
@@ -19,6 +27,7 @@ public class IrisConfig {
 	private static final String COMMENT =
 		"This file stores configuration options for Iris, such as the currently active shaderpack";
 	private final Path propertiesPath;
+	private final Path excludedPath;
 	/**
 	 * The path to the current shaderpack. Null if the internal shaderpack is being used.
 	 */
@@ -28,20 +37,29 @@ public class IrisConfig {
 	 */
 	private boolean enableShaders;
 	/**
+	 * Whether or not to allow core shaders to draw to the main color texture.
+	 */
+	private boolean allowUnknownShaders;
+	/**
 	 * If debug features should be enabled. Gives much more detailed OpenGL error outputs at the cost of performance.
 	 */
 	private boolean enableDebugOptions;
+	/**
+	 * What shaders should be nuked.
+	 */
+	private List<ResourceLocation> shadersToSkip = new ArrayList<>();
 	/**
 	 * If the update notification should be disabled or not.
 	 */
 	private boolean disableUpdateMessage;
 
-	public IrisConfig(Path propertiesPath) {
+	public IrisConfig(Path propertiesPath, Path excluded) {
 		shaderPackName = null;
 		enableShaders = true;
 		enableDebugOptions = false;
 		disableUpdateMessage = false;
 		this.propertiesPath = propertiesPath;
+		this.excludedPath = excluded;
 	}
 
 	/**
@@ -113,6 +131,8 @@ public class IrisConfig {
 		this.enableShaders = enabled;
 	}
 
+	private static Gson GSON = new Gson();
+
 	/**
 	 * loads the config file and then populates the string, int, and boolean entries with the parsed entries
 	 *
@@ -120,6 +140,24 @@ public class IrisConfig {
 	 */
 
 	public void load() throws IOException {
+		if (Files.exists(excludedPath)) {
+			JsonArray json = JsonParser.parseString(Files.readString(excludedPath)).getAsJsonObject().getAsJsonArray("excluded");
+			for (int i = 0; i < json.size(); i++) {
+				ResourceLocation resource = ResourceLocation.tryParse(json.get(i).getAsString());
+				if (resource == null) {
+					Iris.logger.warn("Unknown shader " + json.get(i).getAsString());
+				}
+
+				shadersToSkip.add(resource);
+			}
+		} else {
+			JsonObject defaultV = new JsonObject();
+			JsonArray array = new JsonArray();
+			array.add("put:valuesHere");
+			defaultV.add("excluded", array);
+			Files.writeString(excludedPath, GSON.toJson(defaultV));
+		}
+		
 		if (!Files.exists(propertiesPath)) {
 			return;
 		}
@@ -130,6 +168,7 @@ public class IrisConfig {
 			properties.load(is);
 		}
 		shaderPackName = properties.getProperty("shaderPack");
+		allowUnknownShaders = "true".equals(properties.getProperty("allowUnknownShaders"));
 		enableShaders = !"false".equals(properties.getProperty("enableShaders"));
 		enableDebugOptions = "true".equals(properties.getProperty("enableDebugOptions"));
 		disableUpdateMessage = "true".equals(properties.getProperty("disableUpdateMessage"));
@@ -159,6 +198,7 @@ public class IrisConfig {
 		Properties properties = new Properties();
 		properties.setProperty("shaderPack", getShaderPackName().orElse(""));
 		properties.setProperty("enableShaders", enableShaders ? "true" : "false");
+		properties.setProperty("allowUnknownShaders", allowUnknownShaders ? "true" : "false");
 		properties.setProperty("enableDebugOptions", enableDebugOptions ? "true" : "false");
 		properties.setProperty("disableUpdateMessage", disableUpdateMessage ? "true" : "false");
 		properties.setProperty("maxShadowRenderDistance", String.valueOf(IrisVideoSettings.shadowDistance));
@@ -167,5 +207,13 @@ public class IrisConfig {
 		try (OutputStream os = Files.newOutputStream(propertiesPath)) {
 			properties.store(os, COMMENT);
 		}
+	}
+
+	public boolean shouldAllowUnknownShaders() {
+		return allowUnknownShaders;
+	}
+
+	public boolean shouldSkip(ResourceLocation value) {
+		return shadersToSkip.contains(value); // TODO
 	}
 }

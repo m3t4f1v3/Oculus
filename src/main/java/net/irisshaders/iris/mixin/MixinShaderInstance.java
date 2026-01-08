@@ -4,14 +4,19 @@ import com.google.common.collect.ImmutableSet;
 import com.google.gson.JsonObject;
 import com.mojang.blaze3d.shaders.Uniform;
 import com.mojang.blaze3d.vertex.VertexFormat;
+
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import net.irisshaders.iris.Iris;
 import net.irisshaders.iris.gl.IrisRenderSystem;
 import net.irisshaders.iris.gl.blending.DepthColorStorage;
+import net.irisshaders.iris.pipeline.IrisRenderingPipeline;
 import net.irisshaders.iris.pipeline.ShaderRenderingPipeline;
 import net.irisshaders.iris.pipeline.WorldRenderingPipeline;
 import net.irisshaders.iris.pipeline.programs.ExtendedShader;
 import net.irisshaders.iris.pipeline.programs.FallbackShader;
 import net.irisshaders.iris.pipeline.programs.ShaderInstanceInterface;
+import net.irisshaders.iris.shadows.ShadowRenderer;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.ShaderInstance;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.packs.resources.ResourceProvider;
@@ -31,6 +36,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.LocalCapture;
 
 import java.io.Reader;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
+import java.util.Map;
 import java.util.Objects;
 
 @Mixin(ShaderInstance.class)
@@ -61,6 +70,22 @@ public abstract class MixinShaderInstance implements ShaderInstanceInterface {
         logger.warn(message, arg1, arg2);
     }
 
+    @Unique
+	private static final MethodHandle NONE = MethodHandles.constant(Integer.class, 2);
+
+	@Unique
+	private static final MethodHandle ALWAYS = MethodHandles.constant(Integer.class, 1);
+
+	@Unique
+	private MethodHandle shouldSkip;
+
+	private static Map<Class<?>, MethodHandle> shouldSkipList = new Object2ObjectOpenHashMap<>();
+
+	static {
+		shouldSkipList.put(ExtendedShader.class, NONE);
+		shouldSkipList.put(FallbackShader.class, NONE);
+	}
+
     @Redirect(method = "<init>(Lnet/minecraft/server/packs/resources/ResourceProvider;Lnet/minecraft/resources/ResourceLocation;Lcom/mojang/blaze3d/vertex/VertexFormat;)V", at = @At(value = "INVOKE", target = "Lcom/mojang/blaze3d/shaders/Uniform;glBindAttribLocation(IILjava/lang/CharSequence;)V"))
     public void iris$redirectBindAttributeLocation(int i, int j, CharSequence charSequence) {
         if (((Object) this) instanceof ExtendedShader && ATTRIBUTE_LIST.contains(charSequence)) {
@@ -70,23 +95,82 @@ public abstract class MixinShaderInstance implements ShaderInstanceInterface {
         }
     }
 
-    @Inject(method = "apply", at = @At("TAIL"))
-    private void iris$lockDepthColorState(CallbackInfo ci) {
-        if (((Object) this) instanceof ExtendedShader || ((Object) this) instanceof FallbackShader || !shouldOverrideShaders()) {
-            return;
-        }
+    @Inject(method = "<init>(Lnet/minecraft/server/packs/resources/ResourceProvider;Lnet/minecraft/resources/ResourceLocation;Lcom/mojang/blaze3d/vertex/VertexFormat;)V", at = @At("TAIL"), require = 0)
+	private void iris$storeSkip(ResourceProvider resourceProvider, ResourceLocation string, VertexFormat vertexFormat, CallbackInfo ci) {
+		shouldSkip = shouldSkipList.computeIfAbsent(getClass(), x -> {
+			try {
+				MethodHandle iris$skipDraw = MethodHandles.lookup().findVirtual(x, "iris$skipDraw", MethodType.methodType(boolean.class));
+				Iris.logger.warn("Class " + x.getName() + " has opted out of being rendered with shaders.");
+				return iris$skipDraw;
+			} catch (NoSuchMethodException | IllegalAccessException e) {
+				return NONE;
+			}
+		});
 
-        DepthColorStorage.disableDepthColor();
-    }
+
+		if (Iris.getIrisConfig().shouldSkip(string)) {
+			shouldSkip = ALWAYS;
+		}
+	}
+
+	public boolean iris$shouldSkipThis() {
+		if (Iris.getIrisConfig().shouldAllowUnknownShaders()) {
+			if (!shouldOverrideShaders()) return false;
+
+			if (shouldSkip == NONE) return false;
+			if (shouldSkip == ALWAYS) return true;
+
+			try {
+				return (boolean) shouldSkip.invoke(((ShaderInstance) (Object) this));
+			} catch (Throwable e) {
+				throw new RuntimeException(e);
+			}
+		} else {
+			return !(((Object) this) instanceof ExtendedShader || ((Object) this) instanceof FallbackShader || !shouldOverrideShaders());
+		}
+	}
+
+    @Inject(method = "apply", at = @At("TAIL"))
+	private void onTail(CallbackInfo ci) {
+		if (!iris$shouldSkipThis()) {
+			if (!isKnownShader() && shouldOverrideShaders()) {
+				WorldRenderingPipeline pipeline = Iris.getPipelineManager().getPipelineNullable();
+
+				if (pipeline instanceof IrisRenderingPipeline) {
+					if (ShadowRenderer.ACTIVE) {
+						((IrisRenderingPipeline) pipeline).bindDefaultShadow();
+					} else {
+						((IrisRenderingPipeline) pipeline).bindDefault();
+					}
+				}
+			}
+
+			return;
+		}
+
+		DepthColorStorage.disableDepthColor();
+	}
+
+	private boolean isKnownShader() {
+		return ((Object) this) instanceof ExtendedShader || ((Object) this) instanceof FallbackShader;
+	}
 
     @Inject(method = "clear", at = @At("HEAD"))
-    private void iris$unlockDepthColorState(CallbackInfo ci) {
-        if (((Object) this) instanceof ExtendedShader || ((Object) this) instanceof FallbackShader || !shouldOverrideShaders()) {
-            return;
-        }
+	private void iris$unlockDepthColorState(CallbackInfo ci) {
+		if (!iris$shouldSkipThis()) {
+			if (!isKnownShader() && shouldOverrideShaders()) {
+				WorldRenderingPipeline pipeline = Iris.getPipelineManager().getPipelineNullable();
 
-        DepthColorStorage.unlockDepthColor();
-    }
+				if (pipeline instanceof IrisRenderingPipeline) {
+					Minecraft.getInstance().getMainRenderTarget().bindWrite(false);
+				}
+			}
+
+			return;
+		}
+
+		DepthColorStorage.unlockDepthColor();
+	}
 
     @Redirect(method = "<init>(Lnet/minecraft/server/packs/resources/ResourceProvider;Lnet/minecraft/resources/ResourceLocation;Lcom/mojang/blaze3d/vertex/VertexFormat;)V", at = @At(value = "INVOKE", target = "Lnet/minecraft/util/GsonHelper;parse(Ljava/io/Reader;)Lcom/google/gson/JsonObject;"))
     public JsonObject iris$setupGeometryShader(Reader reader, ResourceProvider resourceProvider, ResourceLocation name, VertexFormat vertexFormat) {
